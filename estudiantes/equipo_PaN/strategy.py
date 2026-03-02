@@ -2,15 +2,23 @@
 """
 Estrategia híbrida Wordle (4/5/6, uniform/frequency).
 
-FIX CRÍTICO:
-- No usamos bitmasks (1<<idx). Con 'ñ' (y cualquier caracter fuera de a-z) explota.
-- Usamos alfabeto dinámico por juego y precomputamos uniq_count por palabra.
+Robustez:
+- NO bitmasks (1<<idx). Usamos alfabeto dinámico por juego.
+- 'ñ' cuenta como letra distinta sin romper nada.
+- Precomputamos codes + uniq_count.
 
-Requisitos:
+Diseño requerido:
 1) Levenshtein con DP + memoria O(L) y cache dict.
 2) Estructuras centrales en diccionarios: self.cache, self.word_info, self.stats.
-3) Levenshtein SOLO como ranking dentro de candidatos válidos (ya filtrados por Wordle).
+3) Levenshtein SOLO para ranking dentro de palabras válidas (tras filter_candidates).
 4) self.exploit + regla concreta (T[L], p_star[L]) + time guard fallback.
+
+Mejoras para reducir “volado”:
+- Parámetros por modo (uniform vs frequency).
+- Non-words SOLO en uniform (frequency usa palabras del vocab).
+- En frequency temprano, el pool de guesses se construye sobre un espacio más amplio
+  (top-K del vocab completo) para incluir “preguntas” más informativas (tipo Entropy).
+- El pool mezcla ranking por prob y ranking por info (cobertura) para no sesgarse.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from wordle_env import filter_candidates
 
 # ------------------------- Levenshtein DP O(L) -------------------------
 def levenshtein_dp_ol(a: str, b: str, cache: dict[tuple[str, str], int]) -> int:
+    """Levenshtein con DP usando 2 filas (memoria O(len(b)))."""
     if a == b:
         return 0
     key = (a, b) if a <= b else (b, a)
@@ -61,6 +70,7 @@ def pattern_code(secret_codes: tuple[int, ...], guess_codes: tuple[int, ...]) ->
     for s in secret_codes:
         remaining[s] = remaining.get(s, 0) + 1
 
+    # verdes
     for i in range(L):
         g = guess_codes[i]
         s = secret_codes[i]
@@ -68,6 +78,7 @@ def pattern_code(secret_codes: tuple[int, ...], guess_codes: tuple[int, ...]) ->
             pat[i] = 2
             remaining[g] -= 1
 
+    # amarillos
     for i in range(L):
         if pat[i] == 2:
             continue
@@ -101,24 +112,25 @@ class MiEstrategia(Strategy):
 
         self.exploit = False
         self._L = int(config.word_length)
-        self._mode = str(config.mode)
+        self._mode = str(config.mode)  # "uniform" o "frequency"
         self._allow_non_words = bool(config.allow_non_words)
 
-        # time guard
+        # time guard (5s por juego incluye begin_game + guesses)
         self._t0 = time.perf_counter()
         self.stats["hard_time_limit"] = 4.85
 
         vocab = list(config.vocabulary)
         n = len(vocab)
 
-        # Probabilidades
+        # Probabilidades (normalizadas)
         probs = np.empty(n, dtype=np.float64)
         for i, w in enumerate(vocab):
             probs[i] = float(config.probabilities.get(w, 0.0))
         s = float(probs.sum())
         probs[:] = probs / s if s > 0 else (1.0 / max(1, n))
+        logp = np.log(probs + 1e-12)
 
-        # Alfabeto dinámico (incluye 'ñ' y cualquier otro caracter presente)
+        # Alfabeto dinámico (incluye 'ñ' y cualquier otro carácter presente)
         alphabet = sorted({c for w in vocab for c in w})
         A = len(alphabet)
         char_to_idx = {c: i for i, c in enumerate(alphabet)}
@@ -126,66 +138,92 @@ class MiEstrategia(Strategy):
 
         # Codes y uniq_count (sin bitmask)
         L = self._L
-        codes = np.empty((n, L), dtype=np.uint16)  # uint16 por si A>255
+        codes = np.empty((n, L), dtype=np.uint16)  # uint16 por si A > 255
         uniq_count = np.empty(n, dtype=np.uint8)
         for i, w in enumerate(vocab):
             row = [char_to_idx[c] for c in w]
             codes[i, :] = row
             uniq_count[i] = len(set(row))
 
+        # Precompute: tuples por palabra (para pattern_code sin reconvertir)
+        code_tuples = [tuple(int(x) for x in codes[i]) for i in range(n)]
+
+        all_idx = np.arange(n, dtype=np.int32)
+
         self.stats["data"] = {
             "words": vocab,
             "probs": probs,
+            "logp": logp,
             "codes": codes,
+            "code_tuples": code_tuples,
             "uniq": uniq_count,
             "word_to_idx": {w: i for i, w in enumerate(vocab)},
             "alphabet": alphabet,
             "A": A,
             "char_to_idx": char_to_idx,
             "idx_to_char": idx_to_char,
+            "all_idx": all_idx,
         }
 
+        # Caches
         self.cache["lev"] = {}  # memo Levenshtein
         self.cache["cand_state"] = {
             "hist_len": 0,
             "candidates": vocab,
-            "cand_idx": np.arange(n, dtype=np.int32),
+            "cand_idx": all_idx.copy(),
         }
 
-        # Parámetros exploit + performance (mismos valores base para 4/5/6,
-        # sin hacks específicos para un solo caso).
-        self.stats["T"] = {4: 4, 5: 6, 6: 8}
-        self.stats["K"] = {4: 220, 5: 280, 6: 320}
-        # N_eval[L]: máximo de candidatos que usamos para el cálculo de
-        # expected information (si hay más, se submuestrean dentro).
+        # ------------------ Parámetros por modo ------------------
+        self.stats["T"] = {
+            "uniform": {4: 4, 5: 6, 6: 8},
+            "frequency": {4: 5, 5: 8, 6: 12},
+        }
+
+        # K: top-k candidatos por prob para “candidatos probables”
+        self.stats["K"] = {
+            "uniform": {4: 220, 5: 280, 6: 320},
+            "frequency": {4: 260, 5: 340, 6: 480},
+        }
+
+        # K_global: en frequency temprano, usamos un “guess space” más amplio (vocab completo)
+        # para meter “preguntas” informativas tipo Entropy sin O(n^2).
+        self.stats["K_global"] = {4: 450, 5: 700, 6: 950}
+
+        # N_eval[L]: máximo de candidatos (top por prob) para estimar entropía
         self.stats["N_eval"] = {4: 900, 5: 650, 6: 550}
-        # K_eval[L]: tamaño del pool refinado para expected remaining.
-        self.stats["K_eval"] = {4: 60, 5: 55, 6: 50}
+        # K_eval[L]: tamaño del pool final (guesses) a evaluar con entropía
+        self.stats["K_eval"] = {4: 60, 5: 55, 6: 55}  # un poquito más en 6 para variedad
+
         self.stats["p_star"] = {
             "uniform": {4: 0.60, 5: 0.60, 6: 0.60},
-            "frequency": {4: 0.18, 5: 0.12, 6: 0.10},
+            "frequency": {4: 0.18, 5: 0.12, 6: 0.12},
         }
 
-        # Pesos scoring barato
+        # Si ya vamos tarde: forzar exploit SOLO cuando el set ya es manejable
+        self.stats["force_exploit_after"] = {"uniform": 4, "frequency": 3}
+        self.stats["force_exploit_cand_cap"] = {"uniform": 500, "frequency": 350}
+
+        # Pesos scoring barato (solo para armar pool; la decisión final usa entropía)
         self.stats["w_pos"] = 1.00
         self.stats["w_uniq"] = 0.70
-        self.stats["w_prob"] = 0.90 if self._mode == "frequency" else 0.25
+        self.stats["w_prob"] = 0.80 if self._mode == "frequency" else 0.15
         self.stats["w_rep_pen"] = 0.35
         self.stats["w_lev"] = 0.40
 
-        # Starter cover guess (posible non-word)
+        # Starter cover guess (posible non-word) — SOLO lo usaremos en uniform
         self.stats["starter_guess"] = self._build_cover_guess(
             cand_idx=self.cache["cand_state"]["cand_idx"], history=[]
         )
 
     def guess(self, history: list[tuple[str, tuple[int, ...]]]) -> str:
+        # Time guard
         if (time.perf_counter() - self._t0) > self.stats["hard_time_limit"]:
             return self._fallback_maxprob(history)
 
         candidates, cand_idx = self._get_candidates(history)
         if not candidates:
             data = self.stats["data"]
-            cand_idx = np.arange(len(data["words"]), dtype=np.int32)
+            cand_idx = data["all_idx"]
 
         if cand_idx.size == 1:
             return self.stats["data"]["words"][int(cand_idx[0])]
@@ -194,7 +232,7 @@ class MiEstrategia(Strategy):
             return self._pick_best_candidate_fast(cand_idx)
 
         L = self._L
-        T = self.stats["T"].get(L, 6)
+        T = self.stats["T"][self._mode].get(L, 6)
         p_star = self.stats["p_star"][self._mode][L]
 
         data = self.stats["data"]
@@ -203,12 +241,21 @@ class MiEstrategia(Strategy):
         probs_norm = probs / s if s > 0 else probs
         max_p = float(probs_norm.max()) if probs_norm.size else 0.0
 
-        if cand_idx.size <= T or max_p >= p_star:
+        # Exploit: tamaño pequeño, o max_p alto
+        # (max_p solo dispara fuerte cuando ya no hay miles de candidatos)
+        if cand_idx.size <= T or (max_p >= p_star and cand_idx.size <= 600):
             self.exploit = True
             return self._pick_best_candidate_fast(cand_idx)
 
-        # primer guess: cover
-        if len(history) == 0 and self._allow_non_words:
+        # Si ya vamos tarde, forzar exploit SOLO si candidatos ya son “manejables”
+        force_after = self.stats["force_exploit_after"][self._mode]
+        cap = self.stats["force_exploit_cand_cap"][self._mode]
+        if len(history) >= force_after and cand_idx.size <= cap:
+            self.exploit = True
+            return self._pick_best_candidate_fast(cand_idx)
+
+        # Primer guess: cover SOLO en uniform
+        if len(history) == 0 and self._allow_non_words and self._mode == "uniform":
             g0 = self.stats["starter_guess"]
             if isinstance(g0, str) and len(g0) == L:
                 return g0
@@ -216,18 +263,29 @@ class MiEstrategia(Strategy):
         pos_freq, let_freq = self._letter_stats(cand_idx)
         proto = self._prototype_from_posfreq(pos_freq)
 
-        top_idx = self._topk_indices_by_prob(cand_idx, self.stats["K"][L])
+        # top_idx: candidatos “probables”
+        top_idx = self._topk_indices_by_prob(cand_idx, self.stats["K"][self._mode][L])
 
-        # Siempre que quede tiempo suficiente intentamos una pasada de expected
-        # information (approx entropy) usando un subconjunto acotado de
-        # candidatos. Si no llega o no mejora, caemos al scoring barato.
+        # guess_space (solo para construir pool):
+        # en frequency temprano y con muchos candidatos, usa top del vocab completo
+        # para permitir “preguntas” más informativas que no siempre son candidatas.
+        guess_space = top_idx
+        if (
+            self._mode == "frequency"
+            and L == 6
+            and len(history) <= 1
+            and cand_idx.size > 900
+        ):
+            all_idx = data["all_idx"]
+            guess_space = self._topk_indices_by_prob(all_idx, self.stats["K_global"][L])
+
+        # Entropía aprox si hay tiempo
         if (time.perf_counter() - self._t0) < 4.2:
-            pool = self._build_guess_pool(top_idx, pos_freq, let_freq, history, proto)
-            gbest = self._best_by_expected_remaining(cand_idx, pool)
+            pool = self._build_guess_pool(guess_space, pos_freq, let_freq, history, proto)
+            gbest = self._best_by_expected_information(cand_idx, pool)
             if gbest is not None:
                 return gbest
 
-        # Fallback estable y barato
         return self._best_by_cheap_score(cand_idx, top_idx, pos_freq, let_freq, history, proto)
 
     # ---------------- candidates (filter_candidates) ----------------
@@ -239,7 +297,7 @@ class MiEstrategia(Strategy):
         if hlen == 0:
             state["hist_len"] = 0
             state["candidates"] = self.stats["data"]["words"]
-            state["cand_idx"] = np.arange(len(state["candidates"]), dtype=np.int32)
+            state["cand_idx"] = self.stats["data"]["all_idx"]
             return state["candidates"], state["cand_idx"]
 
         if state.get("hist_len", 0) == hlen - 1:
@@ -302,6 +360,7 @@ class MiEstrategia(Strategy):
 
     # ---------------- cover guess ----------------
     def _build_cover_guess(self, cand_idx: np.ndarray, history) -> str:
+        """Guess de cobertura (letras frecuentes y distintas). Puede ser non-word."""
         data = self.stats["data"]
         idx_to_char = data["idx_to_char"]
 
@@ -356,10 +415,16 @@ class MiEstrategia(Strategy):
         order = np.argsort(-self.stats["data"]["probs"][top])
         return top[order]
 
-    # ---------------- cheap scoring + levenshtein ----------------
-    def _build_guess_pool(self, top_idx, pos_freq, let_freq, history, proto):
+    # ---------------- pool building ----------------
+    def _build_guess_pool(self, guess_idx, pos_freq, let_freq, history, proto):
+        """
+        Arma pool para evaluar entropía:
+        - mezcla top por "prob-score" y top por "info-score" para no sesgarse.
+        - Levenshtein solo como desempate dentro de palabras del vocab (índices válidos).
+        """
         data = self.stats["data"]
-        words, codes, uniq, probs = data["words"], data["codes"], data["uniq"], data["probs"]
+        words, codes, uniq = data["words"], data["codes"], data["uniq"]
+        logp = data["logp"]
 
         seen = {g for g, _ in history}
         w_pos, w_uniq, w_prob, w_rep, w_lev = (
@@ -371,18 +436,22 @@ class MiEstrategia(Strategy):
         )
         lev_cache = self.cache["lev"]
 
-        scored = []
-        for idx in top_idx:
+        scored_prob = []
+        scored_info = []
+
+        for idx in guess_idx:
             i = int(idx)
             w = words[i]
             if w in seen:
                 continue
             row = codes[i]
 
+            # score por posiciones
             s_pos = 0.0
             for p in range(self._L):
                 s_pos += float(pos_freq[p, int(row[p])])
 
+            # score por letras únicas
             used = set()
             s_u = 0.0
             for p in range(self._L):
@@ -393,29 +462,68 @@ class MiEstrategia(Strategy):
                 s_u += float(let_freq[li])
 
             rep_pen = w_rep * (self._L - int(uniq[i]))
-            pterm = math.log(float(probs[i]) + 1e-12)
 
-            score = w_pos * s_pos + w_uniq * s_u + w_prob * pterm - rep_pen
-            # Levenshtein SOLO para ranking dentro de candidatos
-            score -= w_lev * levenshtein_dp_ol(w, proto, lev_cache)
-            scored.append((score, w))
+            base_info = w_pos * s_pos + w_uniq * s_u - rep_pen
+            base_info -= w_lev * levenshtein_dp_ol(w, proto, lev_cache)
 
-        scored.sort(key=lambda t: t[0], reverse=True)
-        pool = [w for _, w in scored[: self.stats["K_eval"][self._L]]]
+            base_prob = base_info + w_prob * float(logp[i])
 
-        if self._allow_non_words and len(history) <= 1:
-            cover = self._build_cover_guess(top_idx, history)
-            if cover not in seen:
+            scored_info.append((base_info, w))
+            scored_prob.append((base_prob, w))
+
+        scored_prob.sort(key=lambda t: t[0], reverse=True)
+        scored_info.sort(key=lambda t: t[0], reverse=True)
+
+        k_eval = self.stats["K_eval"][self._L]
+        # mezcla: mitad prob, mitad info (deduplicando)
+        take_prob = max(10, k_eval // 2)
+        take_info = k_eval
+
+        pool = []
+        used_w = set()
+
+        for _, w in scored_prob[:take_prob]:
+            if w not in used_w:
+                used_w.add(w)
+                pool.append(w)
+            if len(pool) >= k_eval:
+                break
+
+        if len(pool) < k_eval:
+            for _, w in scored_info[:take_info]:
+                if w not in used_w:
+                    used_w.add(w)
+                    pool.append(w)
+                if len(pool) >= k_eval:
+                    break
+
+        # Non-word cover SOLO en uniform (y solo al inicio)
+        if self._mode == "uniform" and self._allow_non_words and len(history) <= 1:
+            cover = self._build_cover_guess(self.stats["data"]["all_idx"], history)
+            if cover not in used_w:
                 pool.append(cover)
 
-        return pool if pool else [words[int(top_idx[0])]]
+        if not pool:
+            # fallback extremo
+            pool = [data["words"][int(guess_idx[0])]]
+
+        return pool
 
     def _best_by_cheap_score(self, cand_idx, top_idx, pos_freq, let_freq, history, proto):
+        """Fallback barato: elige mejor score dentro de top_idx (candidatos probables)."""
         data = self.stats["data"]
-        words, codes, uniq, probs = data["words"], data["codes"], data["uniq"], data["probs"]
+        words, codes, uniq = data["words"], data["codes"], data["uniq"]
+        logp = data["logp"]
 
         seen = {g for g, _ in history}
-        if self._allow_non_words and len(history) <= 1 and cand_idx.size > 250:
+
+        # Non-word cover SOLO en uniform
+        if (
+            self._mode == "uniform"
+            and self._allow_non_words
+            and len(history) <= 1
+            and cand_idx.size > 250
+        ):
             cover = self._build_cover_guess(cand_idx, history)
             if cover not in seen:
                 return cover
@@ -453,9 +561,8 @@ class MiEstrategia(Strategy):
                 s_u += float(let_freq[li])
 
             rep_pen = w_rep * (self._L - int(uniq[i]))
-            pterm = math.log(float(probs[i]) + 1e-12)
-
-            score = w_pos * s_pos + w_uniq * s_u + w_prob * pterm - rep_pen
+            score = w_pos * s_pos + w_uniq * s_u - rep_pen
+            score += w_prob * float(logp[i])
             score -= w_lev * levenshtein_dp_ol(w, proto, lev_cache)
 
             if score > best_s:
@@ -464,12 +571,19 @@ class MiEstrategia(Strategy):
 
         return best_w
 
-    # ---------------- expected remaining (pequeño) ----------------
+    # ---------------- expected information (entropy approx) ----------------
     def _encode_word(self, w: str) -> tuple[int, ...]:
         m = self.stats["data"]["char_to_idx"]
         return tuple(m[c] for c in w)
 
-    def _best_by_expected_remaining(self, cand_idx, guess_pool):
+    def _best_by_expected_information(self, cand_idx, guess_pool):
+        """
+        Elige g que maximiza entropía (normalizada) de los patrones inducidos,
+        con bonus por p_hit (más fuerte en frequency).
+
+        Evalúa patrones contra un subconjunto top-N_eval por probabilidad
+        cuando hay muchos candidatos (anti-timeout).
+        """
         if (time.perf_counter() - self._t0) > 4.35:
             return None
 
@@ -482,13 +596,10 @@ class MiEstrategia(Strategy):
             else np.full_like(probs_all, 1.0 / max(1, probs_all.size), dtype=np.float64)
         )
 
-        # Para no explotar el tiempo cuando hay muchos candidatos, usamos solo
-        # un subconjunto de hasta N_eval[L] candidatos para estimar la
-        # información esperada. Se seleccionan por probabilidad (top-N), lo que
-        # funciona tanto en uniform como en frequency.
         L = self._L
         N_eval = self.stats["N_eval"].get(L, probs.size)
         m = probs.size
+
         if m <= N_eval:
             eval_idx = cand_idx
             probs_eval = probs
@@ -498,20 +609,22 @@ class MiEstrategia(Strategy):
             eval_idx = cand_idx[part]
             probs_eval = probs[part]
 
-        cand_codes_arr = data["codes"][eval_idx]
-        cand_codes = [tuple(int(x) for x in row) for row in cand_codes_arr]
+        code_tuples = data["code_tuples"]
+        cand_codes = [code_tuples[int(idx)] for idx in eval_idx]
 
         n_patterns = 3 ** L
-
-        best_guess, best_obj = None, float("inf")
         w2i = data["word_to_idx"]
 
-        # Peso del término de “hit directo”: en frequency nos importa algo más
-        # acertar pronto que en uniform, pero sin dominar a la entropía.
+        # idx->prob para p_hit en O(1)
+        idx_prob = {int(idx): float(probs[j]) for j, idx in enumerate(cand_idx)}
+
+        # bonus p_hit
         if self._mode == "frequency":
-            alpha_hit = 0.25
+            alpha_hit = {4: 0.30, 5: 0.40, 6: 0.48}.get(L, 0.40)
         else:
-            alpha_hit = 0.15
+            alpha_hit = 0.10
+
+        best_guess, best_obj = None, float("inf")
 
         for g in guess_pool:
             if len(g) != L:
@@ -526,25 +639,20 @@ class MiEstrategia(Strategy):
                 pc = pattern_code(sc, gc)
                 masses[pc] += float(probs_eval[i])
 
-            # Entropía aproximada de la partición inducida por g:
-            # ent = -sum_k p_k * log(p_k), con p_k masa de probabilidad en cada
-            # patrón. Esto funciona en uniform y en frequency.
+            tot = sum(masses)
+            if tot <= 0.0:
+                continue
+
             ent = 0.0
+            inv_tot = 1.0 / tot
             for mk in masses:
                 if mk > 0.0:
-                    ent -= mk * math.log(mk + 1e-12)
+                    pk = mk * inv_tot
+                    ent -= pk * math.log(pk + 1e-12)
 
-            # bonus por hit directo: probabilidad de que g sea el secreto
-            p_hit = 0.0
             gi = w2i.get(g)
-            if gi is not None:
-                for j, idx in enumerate(cand_idx):
-                    if int(idx) == int(gi):
-                        p_hit = float(probs[j])
-                        break
+            p_hit = float(idx_prob.get(int(gi), 0.0)) if gi is not None else 0.0
 
-            # Queremos maximizar entropía y también p_hit. Minimizar obj
-            # equivale a maximizar ambos términos.
             obj = -ent - alpha_hit * p_hit
             if obj < best_obj:
                 best_obj, best_guess = obj, g
